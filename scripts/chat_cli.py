@@ -18,13 +18,14 @@ parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the mod
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+parser.add_argument('--checkpoint-compat', type=str, default=None, choices=['legacy-d32'], help='Compatibility mode for older public checkpoints')
 args = parser.parse_args()
 
 # Init the model and tokenizer
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step, checkpoint_compat=args.checkpoint_compat)
 
 # Special tokens for the chat state machine
 bos = tokenizer.get_bos_token_id()

@@ -20,12 +20,17 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
-def _patch_missing_config_keys(model_config_kwargs):
+def _patch_missing_config_keys(model_config_kwargs, checkpoint_compat=None):
     """Add default values for new config keys missing in old checkpoints."""
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if checkpoint_compat == "legacy-d32":
+        model_config_kwargs["enable_smear"] = False
+        model_config_kwargs["enable_backout"] = False
+        model_config_kwargs["enable_value_embeds"] = False
+        log0("Applying checkpoint compatibility mode: legacy-d32")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -74,7 +79,7 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     return model_data, optimizer_data, meta_data
 
 
-def build_model(checkpoint_dir, step, device, phase):
+def build_model(checkpoint_dir, step, device, phase, checkpoint_compat=None):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
@@ -93,7 +98,7 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
+    _patch_missing_config_keys(model_config_kwargs, checkpoint_compat=checkpoint_compat)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)
@@ -146,7 +151,7 @@ def find_last_step(checkpoint_dir):
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
-def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
+def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None, checkpoint_compat=None):
     if model_tag is None:
         # guess the model tag by defaulting to the largest model
         model_tag = find_largest_model(checkpoints_dir)
@@ -158,7 +163,7 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     assert step is not None, f"No checkpoints found in {checkpoint_dir}"
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
-    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase, checkpoint_compat=checkpoint_compat)
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):

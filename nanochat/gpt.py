@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Optional feature gates for backward compatibility with older public checkpoints.
+    enable_smear: bool = True
+    enable_backout: bool = True
+    enable_value_embeds: bool = True
 
 
 def norm(x):
@@ -77,7 +81,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if (config.enable_value_embeds and has_ve(layer_idx, config.n_layer)) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -180,14 +184,21 @@ class GPT(nn.Module):
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
-        self.smear_gate = Linear(24, 1, bias=False)
-        self.smear_lambda = nn.Parameter(torch.zeros(1))
+        if config.enable_smear:
+            self.smear_gate = Linear(24, 1, bias=False)
+            self.smear_lambda = nn.Parameter(torch.zeros(1))
+        else:
+            self.smear_gate = None
+            self.register_parameter('smear_lambda', None)
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
-        self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
+        if config.enable_backout:
+            self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
+        else:
+            self.register_parameter('backout_lambda', None)
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)}) if config.enable_value_embeds else nn.ModuleDict()
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -239,9 +250,11 @@ class GPT(nn.Module):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
         # Smear/backout scalars and smear gate must be explicitly initialized 
-        torch.nn.init.zeros_(self.smear_lambda)
-        torch.nn.init.constant_(self.backout_lambda, 0.2)
-        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
+        if self.smear_lambda is not None:
+            torch.nn.init.zeros_(self.smear_lambda)
+            torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
+        if self.backout_lambda is not None:
+            torch.nn.init.constant_(self.backout_lambda, 0.2)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
@@ -329,9 +342,11 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        smear_numel = 0 if self.smear_lambda is None else (self.smear_gate.weight.numel() + self.smear_lambda.numel())
+        backout_numel = 0 if self.backout_lambda is None else self.backout_lambda.numel()
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+                          smear_numel + backout_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -359,7 +374,11 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        if self.smear_lambda is not None:
+            scalars += self.smear_gate.weight.numel() + self.smear_lambda.numel()
+        if self.backout_lambda is not None:
+            scalars += self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -382,7 +401,11 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+        smear_params = []
+        if self.smear_lambda is not None:
+            smear_params.extend([self.smear_gate.weight, self.smear_lambda])
+        if self.backout_lambda is not None:
+            smear_params.append(self.backout_lambda)
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
@@ -399,6 +422,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        param_groups = [g for g in param_groups if len(g['params']) > 0]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -430,23 +454,24 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
-        if kv_cache is None:
-            # Training / naive generate: full sequence available, use fast slice
-            assert T > 1, "Training forward pass should have T > 1"
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-        else:
-            # KV cache inference: read prev embedding from cache, store current for next step
-            x_pre_smear = kv_cache.prev_embedding
-            kv_cache.prev_embedding = x[:, -1:, :]
-            if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
+        if self.smear_lambda is not None:
+            if kv_cache is None:
+                # Training / naive generate: full sequence available, use fast slice
+                assert T > 1, "Training forward pass should have T > 1"
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
                 x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-            elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
-                x = x + gate * x_pre_smear
+            else:
+                # KV cache inference: read prev embedding from cache, store current for next step
+                x_pre_smear = kv_cache.prev_embedding
+                kv_cache.prev_embedding = x[:, -1:, :]
+                if T > 1:
+                    # Prefill: apply smear to positions 1+, same as training
+                    gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                    x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+                elif x_pre_smear is not None:
+                    # Decode: single token, use cached prev embedding
+                    gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
+                    x = x + gate * x_pre_smear
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
@@ -460,7 +485,7 @@ class GPT(nn.Module):
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
+        if x_backout is not None and self.backout_lambda is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
